@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM template for Lambda ToDo API
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30 # seconds
+    MemorySize: 128 # MB
+    Environment:
+      Variables:
+        TODO_TABLE_NAME: !Ref TodoTable
+        ATTACHMENTS_S3_BUCKET_NAME: !Ref TodoAttachmentsBucket
+    Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref TodoTable
+      # Specific policy for object actions within the bucket
+      - Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              # s3:GetObjectAcl # If you need to manage ACLs for objects
+              # s3:PutObjectAcl # If you need to manage ACLs for objects
+            Resource:
+              - !Sub ${TodoAttachmentsBucket.Arn}/* # For objects
+              # - !Sub ${TodoAttachmentsBucket.Arn} # For bucket-level operations if any were needed (e.g. ListBucket)
+  Api:
+    Auth:
+      DefaultAuthorizer: ApiGatewayCognitoAuthorizer
+      Authorizers:
+        ApiGatewayCognitoAuthorizer:
+          UserPoolArn: !GetAtt CognitoUserPool.Arn
+          Identity:
+            Header: Authorization
+
+Resources:
+  TodoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TodoTable
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: userId # Added for GSI
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes: # Added GSI for querying by userId
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL # Project all attributes to the GSI
+
+  TodoAttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # BucketName: !Sub "todo-attachments-${AWS::StackName}-${AWS::Region}" # Example of a more unique name
+      # To make it simpler for this exercise, we'll let CFN generate a unique physical ID
+      # by not specifying BucketName, or use a simple one if allowed by account.
+      # For real deployments, a well-defined naming strategy is crucial.
+      # BucketName: my-unique-todo-attachments-bucket # Replace if you need a fixed name and it's available
+      PublicAccessBlockConfiguration: # Recommended for most use cases
+        BlockPublicAcls: True
+        IgnorePublicAcls: True
+        BlockPublicPolicy: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - GET
+              - DELETE
+            AllowedOrigins: # IMPORTANT: Restrict this in production!
+              - "*" # Placeholder - e.g. https://*.example.com
+            MaxAge: 3000
+            ExposedHeaders:
+              - ETag # Example
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldObjects
+            Status: Enabled
+            ExpirationInDays: 365 # Example: delete objects older than 1 year
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: MyTodoAppUserPool
+      UsernameAttributes:
+        - email
+      AliasAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  CreateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/create-todo/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos
+            Method: POST
+            # Auth removed as it's now global
+
+  ReadTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/read-todo/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: GET
+            # Auth removed as it's now global
+
+  UpdateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/update-todo/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: PUT
+            # Auth removed as it's now global
+
+  DeleteTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/delete-todo/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: DELETE
+            # Auth removed as it's now global
+
+  ListTodosFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/list-todos/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos
+            Method: GET
+            # Auth removed as it's now global
+
+  GenerateUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./lambda/generate-upload-url/
+      # Inherits Globals: Runtime, Timeout, MemorySize, Environment, Policies (incl. S3)
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /todos/attachment-upload-url # Or /todos/{id}/attachment-upload-url
+            Method: GET
+            # Auth: DefaultAuthorizer (ApiGatewayCognitoAuthorizer) is inherited from Globals.Api
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: MyTodoAppUserPoolClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - USER_PASSWORD_AUTH
+
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  CognitoUserPoolClientId:
+    Description: "ID of the Cognito User Pool Client"
+    Value: !Ref CognitoUserPoolClient
+  TodoTableName:
+    Description: "Name of the DynamoDB table for ToDos"
+    Value: !Ref TodoTable
+  TodoAttachmentsBucketName:
+    Description: "Name of the S3 bucket for ToDo item attachments"
+    Value: !Ref TodoAttachmentsBucket
